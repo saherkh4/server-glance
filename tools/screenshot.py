@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Render the demo dashboard to SVG screenshots for the README (docs/*.svg)."""
+"""Render the demo dashboard to SVG screenshots for the README (docs/*.svg).
+
+Uses the console glyph set, so icons and bar glyphs are drawn pixel-for-pixel
+from the same bitmaps that go into the generated console font.
+"""
 import html
 import importlib.util
 import pathlib
@@ -11,99 +15,121 @@ spec = importlib.util.spec_from_file_location("glance", ROOT / "glance.py")
 glance = importlib.util.module_from_spec(spec)
 sys.modules["glance"] = glance
 spec.loader.exec_module(glance)
+glance.T = glance.Term("console", "truecolor")
 
-PALETTE = {30: "#1e1e2e", 31: "#f38ba8", 32: "#a6e3a1", 33: "#f5c542", 36: "#89dceb", 37: "#cdd6f4"}
-BG = {41: "#e5484d", 42: "#30a46c", 43: "#f5d90a"}
-FG, DIM_FG, WIN_BG = "#cdd6f4", "#6c7086", "#11111b"
-CW, LH, FS = 8.4, 18, 14
-COLS, ROWS = 108, 27
-
-
-def frame_cells(frame: str):
-    """Yield (row, col, text, fg, bg, bold) runs from an ANSI frame."""
-    frame = frame.removeprefix("\x1b[H").removesuffix("\x1b[J")
-    for row, line in enumerate(frame.split("\n")):
-        col, fg, bg, bold, dim = 0, None, None, False, False
-        for token in re.split(r"(\x1b\[[0-9;]*m)", line):
-            m = re.fullmatch(r"\x1b\[([0-9;]*)m", token)
-            if m:
-                for code in [int(c or 0) for c in m.group(1).split(";")]:
-                    if code == 0:
-                        fg, bg, bold, dim = None, None, False, False
-                    elif code == 1:
-                        bold = True
-                    elif code == 2:
-                        dim = True
-                    elif code in PALETTE:
-                        fg = PALETTE[code]
-                    elif code in BG:
-                        bg = BG[code]
-                continue
-            if token:
-                color = fg or (DIM_FG if dim else FG)
-                if dim and fg:
-                    color = DIM_FG if token.strip("█░") else "#313244" if "░" in token else color
-                yield row, col, token, color, bg, bold
-                col += len(token)
+CW, LH, FS = 8.4, 17, 14       # cell width/height and font size in the SVG
+GW, GH = 14, 28                # console glyph bitmap size
+COLS, ROWS = 132, 37
+BG = glance.THEME["base"]
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
 
 
-def to_svg(snap, title: str) -> str:
-    frame = glance.render(snap, COLS, ROWS, vt=8)
-    pad, bar = 18, 34
-    width, height = COLS * CW + pad * 2, ROWS * LH + pad * 2 + bar
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0f}" height="{height:.0f}" '
-           f'viewBox="0 0 {width:.0f} {height:.0f}" font-family="\'JetBrains Mono\',\'DejaVu Sans Mono\','
-           f'Menlo,Consolas,monospace" font-size="{FS}">',
-           f'<rect width="100%" height="100%" rx="12" fill="{WIN_BG}"/>',
-           '<circle cx="22" cy="17" r="6" fill="#f38ba8"/><circle cx="42" cy="17" r="6" fill="#f9e2af"/>'
-           '<circle cx="62" cy="17" r="6" fill="#a6e3a1"/>',
-           f'<text x="{width / 2:.0f}" y="22" fill="{DIM_FG}" text-anchor="middle" font-size="12">'
-           f'{html.escape(title)}</text>']
-    for row, col, text, fg, bg, bold in frame_cells(frame):
-        x, y = pad + col * CW, bar + pad + row * LH
-        if bg:
-            out.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{len(text) * CW:.1f}" height="{LH}" fill="{bg}"/>')
-        if text and set(text) <= {"█", "░"}:
-            # Draw bar glyphs as solid shapes so they look seamless at any zoom.
-            for i, run in enumerate(re.findall(r"█+|░+", text)):
-                rx = x + (len(text.split(run)[0]) if i == 0 else text.index(run)) * CW
-                color = "#313244" if run[0] == "░" else fg
-                out.append(f'<rect x="{rx:.1f}" y="{y + 3:.1f}" width="{len(run) * CW:.1f}" '
-                           f'height="{LH - 6}" rx="2" fill="{color}"/>')
+def cells(line: str):
+    """Yield (col, char, fg, bg, bold) for every cell of an ANSI line."""
+    fg, bg, bold, col = None, None, False, 0
+    for tok in re.split(r"(\x1b\[[0-9;]*m)", line):
+        m = SGR.fullmatch(tok)
+        if m:
+            codes = [int(c or 0) for c in m.group(1).split(";")]
+            i = 0
+            while i < len(codes):
+                c = codes[i]
+                if c == 0:
+                    fg, bg, bold = None, None, False
+                elif c == 1:
+                    bold = True
+                elif c in (38, 48) and i + 4 < len(codes) and codes[i + 1] == 2:
+                    color = "#%02x%02x%02x" % tuple(codes[i + 2:i + 5])
+                    fg, bg = (color, bg) if c == 38 else (fg, color)
+                    i += 4
+                i += 1
             continue
-        if text.strip():
-            fill = "#11111b" if bg else fg
-            weight = ' font-weight="bold"' if bold else ""
-            out.append(f'<text x="{x:.1f}" y="{y + LH - 5:.1f}" fill="{fill}"{weight} xml:space="preserve" '
-                       f'textLength="{len(text) * CW:.1f}" lengthAdjust="spacingAndGlyphs">'
-                       f'{html.escape(text)}</text>')
+        for ch in tok:
+            yield col, ch, fg or glance.THEME["text"], bg, bold
+            col += glance.cwidth(ch)
+
+
+def glyph_rects(bitmap, x0, y0, color):
+    """Merge lit pixels into rectangles (horizontal runs, stacked when identical)."""
+    out, open_runs = [], {}
+    for y, row in enumerate(bitmap + [[False] * GW]):
+        runs, x = set(), 0
+        while x < len(row):
+            if row[x]:
+                start = x
+                while x < len(row) and row[x]:
+                    x += 1
+                runs.add((start, x))
+            x += 1
+        for run in list(open_runs):
+            if run not in runs:
+                y_start = open_runs.pop(run)
+                out.append(f'<rect x="{x0 + run[0] * CW / GW:.2f}" y="{y0 + y_start * LH / GH:.2f}" '
+                           f'width="{(run[1] - run[0]) * CW / GW:.2f}" height="{(y - y_start) * LH / GH:.2f}" fill="{color}"/>')
+        for run in runs:
+            open_runs.setdefault(run, y)
+    return out
+
+
+def to_svg(snap, title):
+    lines = glance.render_lines(snap, COLS, ROWS, vt=8)
+    pad, bar = 16, 30
+    width, height = COLS * CW + pad * 2, ROWS * LH + pad * 2 + bar
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0f}" height="{height:.0f}" viewBox="0 0 {width:.0f} {height:.0f}" '
+           f'font-family="\'JetBrains Mono\',\'DejaVu Sans Mono\',Menlo,Consolas,monospace" font-size="{FS}" shape-rendering="crispEdges">',
+           f'<rect width="100%" height="100%" rx="12" fill="{BG}"/>',
+           '<circle cx="20" cy="15" r="5.5" fill="#f38ba8"/><circle cx="38" cy="15" r="5.5" fill="#f9e2af"/>'
+           '<circle cx="56" cy="15" r="5.5" fill="#a6e3a1"/>',
+           f'<text x="{width / 2:.0f}" y="20" fill="#7f849c" text-anchor="middle" font-size="12">{html.escape(title)}</text>']
+    for row, line in enumerate(lines):
+        y = bar + pad + row * LH
+        text_run = None
+        for col, ch, fg, bg, bold in list(cells(line)) + [(COLS, "", None, None, False)]:
+            x = pad + col * CW
+            if bg and ch:
+                out.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{CW + 0.3:.2f}" height="{LH + 0.3:.2f}" fill="{bg}"/>')
+            bitmap = glance.custom_glyph(ch, GW, GH) if ch else None
+            if bitmap is None and ch == "█":
+                bitmap = [[True] * GW for _ in range(GH)]
+            plain = ch and bitmap is None and ch != " "
+            key = (fg, bold)
+            if text_run and (not plain or text_run[2] != key or text_run[3] != col):
+                tx, chars, (tfg, tbold), _ = text_run
+                weight = ' font-weight="bold"' if tbold else ""
+                out.append(f'<text x="{tx:.2f}" y="{y + LH - 4:.2f}" fill="{tfg}"{weight} xml:space="preserve" '
+                           f'textLength="{len(chars) * CW:.2f}" lengthAdjust="spacingAndGlyphs">{html.escape(chars)}</text>')
+                text_run = None
+            if bitmap is not None:
+                out += glyph_rects(bitmap, x, y, fg)
+            elif plain:
+                text_run = (text_run[0], text_run[1] + ch, key, col + 1) if text_run else (x, ch, key, col + 1)
     out.append("</svg>")
     return "\n".join(out)
 
 
 def healthy():
-    snap = glance.demo_snapshot()
-    snap.data["services"]["watched"] = [w if w[0] != "backup" else ("backup", "system", "active")
-                                        for w in snap.data["services"]["watched"]]
-    snap.data["services"]["failed"] = []
-    snap.data["system"]["disks"][0].update(pct=52, avail_gb=221.4)
-    snap.data["docker"]["running"] = 12
-    snap.issues = glance.evaluate(snap.data)
+    snap = glance.demo_snapshot(t=1000)
+    d = snap.data
+    d["services"]["watched"] = [(n, s, "active") for n, s, _ in d["services"]["watched"]]
+    d["disks"][0].update(pct=52, avail_gb=221.4)
+    d["docker"]["running"] = 12
+    snap.issues = glance.evaluate(d)
     return snap
 
 
-def on_battery():
-    snap = glance.demo_snapshot()
-    snap.data["battery"].update(capacity=23, status="Discharging", eta=4140, watts=11.2)
-    snap.data["ac"] = False
-    snap.data["temps"] = [("CPU", 84.0), ("NVMe", 47.0), ("WiFi", 41.0)]
-    snap.issues = glance.evaluate(snap.data)
+def needs_attention():
+    snap = glance.demo_snapshot(t=1000)
+    d = snap.data
+    d["power"] = {"battery": {"capacity": 23, "status": "Discharging", "eta": 4140, "health": 91, "watts": 11.2}, "ac": False}
+    d["temps"] = [("CPU", 84.0), ("NVMe", 47.0), ("WiFi", 41.0)]
+    d["runners"][2] = dict(d["runners"][2], state="down", reason="oom-kill")
+    snap.issues = glance.evaluate(d)
     return snap
 
 
 if __name__ == "__main__":
     docs = ROOT / "docs"
     docs.mkdir(exist_ok=True)
-    (docs / "healthy.svg").write_text(to_svg(healthy(), "tty8 - all good"))
-    (docs / "issues.svg").write_text(to_svg(on_battery(), "tty8 - something needs attention"))
+    (docs / "healthy.svg").write_text(to_svg(healthy(), "tty8 · all good"))
+    (docs / "issues.svg").write_text(to_svg(needs_attention(), "tty8 · something needs attention"))
     print("wrote docs/healthy.svg, docs/issues.svg")

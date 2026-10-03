@@ -37,11 +37,22 @@ RUN_GROUP="$(id -gn "$RUN_USER")"
 install -d -m 755 "$PREFIX"
 install -m 755 "$SRC/glance.py" "$PREFIX/glance.py"
 
+# Build a copy of the console font with icons and smooth bar glyphs added.
+FONTFILE="$FONT"
+GLYPHS=basic
+FONT_SRC="$(ls /usr/share/consolefonts/"$FONT".psf* 2>/dev/null | head -n1 || true)"
+if [[ -n "$FONT_SRC" ]] && python3 "$PREFIX/glance.py" --build-font "$FONT_SRC" "$PREFIX/glance.psf"; then
+  FONTFILE="$PREFIX/glance.psf"
+  GLYPHS=console
+else
+  echo "Note: could not build the icon font from '$FONT'; using plain glyphs." >&2
+fi
+
 # Lets the user's systemd manager run at boot without a login, so user units can be checked.
 loginctl enable-linger "$RUN_USER" 2>/dev/null || true
 
 sed -e "s|@PREFIX@|$PREFIX|g" -e "s|@USER@|$RUN_USER|g" -e "s|@GROUP@|$RUN_GROUP|g" \
-    -e "s|@UID@|$RUN_UID|g" -e "s|@VT@|$VT|g" -e "s|@FONT@|$FONT|g" \
+    -e "s|@UID@|$RUN_UID|g" -e "s|@VT@|$VT|g" -e "s|@FONTFILE@|$FONTFILE|g" -e "s|@GLYPHS@|$GLYPHS|g" \
     "$SRC/server-glance.service.in" > "$UNIT"
 chmod 644 "$UNIT"
 

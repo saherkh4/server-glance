@@ -12,8 +12,10 @@ Group=@GROUP@
 Environment=XDG_RUNTIME_DIR=/run/user/@UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
 Environment=PYTHONUNBUFFERED=1
-# Larger console font on this VT only, so it reads well from across the room.
-ExecStartPre=-+/usr/bin/setfont -C /dev/tty@VT@ @FONT@
+Environment=TERM=linux
+Environment=GLANCE_GLYPHS=@GLYPHS@
+# Larger console font with Server Glance's icons, on this VT only.
+ExecStartPre=-+/usr/bin/setfont -C /dev/tty@VT@ @FONTFILE@
 ExecStart=/usr/bin/python3 @PREFIX@/glance.py
 StandardInput=tty
 StandardOutput=tty

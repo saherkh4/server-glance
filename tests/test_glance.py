@@ -1,6 +1,10 @@
+import gzip
 import importlib.util
+import os
 import pathlib
+import struct
 import sys
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location("glance", pathlib.Path(__file__).parents[1] / "glance.py")
@@ -9,40 +13,54 @@ sys.modules["glance"] = glance
 spec.loader.exec_module(glance)
 
 
-def base_data(**overrides):
-    data = glance.demo_snapshot().data
+def healthy_data(**overrides):
+    data = glance.demo_snapshot(t=0).data
     data["services"] = {"watched": [], "failed": [], "ssh": True}
-    data["system"]["disks"] = [{"mount": "/", "pct": 40, "avail_gb": 100}]
+    data["disks"] = [{"mount": "/", "pct": 40, "avail_gb": 100}]
     data.update(overrides)
     return data
 
 
 class EvaluateTests(unittest.TestCase):
     def test_healthy_machine_has_no_issues(self):
-        self.assertEqual(glance.evaluate(base_data()), [])
+        self.assertEqual(glance.evaluate(healthy_data()), [])
 
     def test_unplugged_charger_is_reported(self):
-        battery = dict(base_data()["battery"], status="Discharging", capacity=50)
-        issues = glance.evaluate(base_data(battery=battery, ac=False))
+        power = {"battery": {"capacity": 50, "status": "Discharging", "eta": 3600, "health": 90, "watts": 9}, "ac": False}
+        issues = glance.evaluate(healthy_data(power=power))
         self.assertTrue(any("battery power" in i.text for i in issues))
 
     def test_low_battery_is_critical(self):
-        battery = dict(base_data()["battery"], status="Discharging", capacity=9)
-        levels = {i.level for i in glance.evaluate(base_data(battery=battery, ac=False))}
-        self.assertIn("crit", levels)
+        power = {"battery": {"capacity": 9, "status": "Discharging", "eta": 600, "health": 90, "watts": 9}, "ac": False}
+        self.assertIn("crit", {i.level for i in glance.evaluate(healthy_data(power=power))})
 
     def test_hot_cpu(self):
-        issues = glance.evaluate(base_data(temps=[("CPU", 93.0)]))
-        self.assertEqual(issues[0].level, "crit")
+        self.assertEqual(glance.evaluate(healthy_data(temps=[("CPU", 93.0)]))[0].level, "crit")
 
     def test_disabled_service_is_not_an_issue(self):
         services = {"watched": [("old-app", "user", "disabled")], "failed": [], "ssh": True}
-        self.assertEqual(glance.evaluate(base_data(services=services)), [])
+        self.assertEqual(glance.evaluate(healthy_data(services=services)), [])
+
+    def test_runners_down_are_grouped_into_one_warning(self):
+        runners = [{"unit": f"u{i}", "repo": "r", "name": f"n{i}", "state": "down", "since": None, "reason": "oom-kill"}
+                   for i in range(3)]
+        issues = glance.evaluate(healthy_data(runners=runners))
+        self.assertEqual([i.text for i in issues], ["3 GitHub runners down (oom-kill)"])
+
+    def test_slow_ethernet_without_ip(self):
+        lan = healthy_data()["lan"]
+        lan["nics"][0].update(speed=10, ip=None)
+        texts = " ".join(i.text for i in glance.evaluate(healthy_data(lan=lan)))
+        self.assertIn("10 Mb/s", texts)
+        self.assertIn("no IP address", texts)
+
+    def test_unreachable_gateway_is_critical(self):
+        lan = dict(healthy_data()["lan"], gw_ms=None)
+        self.assertEqual(glance.evaluate(healthy_data(lan=lan))[0].level, "crit")
 
     def test_criticals_sort_first(self):
-        data = base_data(temps=[("CPU", 82.0)], network=dict(base_data()["network"], internet="offline"))
-        issues = glance.evaluate(data)
-        self.assertEqual([i.level for i in issues], ["crit", "warn"])
+        data = healthy_data(temps=[("CPU", 82.0)], internet=dict(healthy_data()["internet"], state="offline"))
+        self.assertEqual([i.level for i in glance.evaluate(data)], ["crit", "warn"])
 
 
 class DisplayWatcherTests(unittest.TestCase):
@@ -64,14 +82,51 @@ class DisplayWatcherTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
-    def test_render_fits_terminal(self):
-        frame = glance.render(glance.demo_snapshot(), 100, 30, vt=8)
-        lines = frame.removeprefix("\x1b[H").removesuffix("\x1b[J").split("\n")
-        self.assertEqual(len(lines), 30)
-        self.assertTrue(all(glance.vlen(line) == 100 for line in lines))
+    def check_frame(self, glyphs, colors, width, height):
+        glance.T = glance.Term(glyphs, colors)
+        lines = glance.render_lines(glance.demo_snapshot(t=0), width, height, vt=8)
+        self.assertEqual(len(lines), height)
+        for line in lines:
+            self.assertEqual(glance.vlen(line), width, repr(line))
 
-    def test_small_terminal_does_not_crash(self):
-        glance.render(glance.demo_snapshot(), 40, 10)
+    def test_every_mode_fills_the_screen_exactly(self):
+        for glyphs in ("console", "unicode", "basic"):
+            for colors in ("palette", "truecolor", "ansi"):
+                for width, height in ((137, 38), (100, 30), (80, 24)):
+                    with self.subTest(glyphs=glyphs, colors=colors, size=(width, height)):
+                        self.check_frame(glyphs, colors, width, height)
+
+    def test_tiny_terminal_does_not_crash(self):
+        glance.T = glance.Term()
+        glance.render_lines(glance.demo_snapshot(t=0), 40, 10)
+
+    def test_fit_handles_wide_characters(self):
+        self.assertEqual(glance.vlen(glance.fit("🔋🔋🔋", 5)), 5)
+
+
+class FontTests(unittest.TestCase):
+    def make_font(self, path):
+        """A tiny 8x16 PSF2 font: ASCII plus Latin-1 letters we can repurpose."""
+        chars = [chr(c) for c in range(32, 127)] + [chr(c) for c in range(0xC0, 0x100)]
+        n, h, w = len(chars), 16, 8
+        header = struct.pack("<8I", 0x864AB572, 0, 32, 1, n, h, h, w)
+        table = b"".join(c.encode() + b"\xff" for c in chars)
+        with gzip.open(path, "wb") as f:
+            f.write(header + bytes(n * h) + table)
+
+    def test_build_font_adds_blocks_and_icons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = os.path.join(tmp, "in.psf.gz"), os.path.join(tmp, "out.psf")
+            self.make_font(src)
+            added = glance.build_font(src, dst)
+            self.assertEqual(added, len(glance.CUSTOM_CHARS))
+            raw = pathlib.Path(dst).read_bytes()
+            self.assertEqual(raw[:4], b"\x72\xb5\x4a\x86")
+            _, _, hs, flags, n, cs, h, w = struct.unpack("<8I", raw[:32])
+            table = "".join(e.decode("utf-8") for e in raw[hs + n * cs:].split(b"\xff"))
+            for ch in glance.CUSTOM_CHARS:
+                self.assertIn(ch, table)
+            self.assertIn("A", table)  # ASCII is never touched
 
 
 if __name__ == "__main__":
