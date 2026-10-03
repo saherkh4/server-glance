@@ -1793,13 +1793,13 @@ def main() -> int:
         configure_term(full_screen=False)
         snap = demo_snapshot() if demo else sampled_snapshot()
         print(json.dumps({"issues": [i.__dict__ for i in snap.issues], **snap.data}, indent=2, default=str))
-        return 1 if any(i.level == "crit" for i in snap.issues) else 0
+        return 1 if not demo and any(i.level == "crit" for i in snap.issues) else 0
     if "--once" in args:
         configure_term(full_screen=False)
         snap = demo_snapshot() if demo else sampled_snapshot()
         width, _ = terminal_size()
         print("\n".join(render_lines(snap, min(width, 150))))
-        return 1 if any(i.level == "crit" for i in snap.issues) else 0
+        return 1 if not demo and any(i.level == "crit" for i in snap.issues) else 0
 
     configure_term(full_screen=True)
     collector = None
