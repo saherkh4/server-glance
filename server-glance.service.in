@@ -1,0 +1,32 @@
+[Unit]
+Description=Server Glance - one-glance status on the local console (tty@VT@)
+Documentation=https://github.com/saherkh4/server-glance
+After=systemd-user-sessions.service user@@UID@.service network-online.target
+Wants=network-online.target
+Conflicts=getty@tty@VT@.service autovt@tty@VT@.service
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+Environment=PYTHONUNBUFFERED=1
+# Larger console font on this VT only, so it reads well from across the room.
+ExecStartPre=-+/usr/bin/setfont -C /dev/tty@VT@ @FONT@
+ExecStart=/usr/bin/python3 @PREFIX@/glance.py
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty@VT@
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+# Lets it bring its VT to the front when the lid opens or a screen is plugged in.
+AmbientCapabilities=CAP_SYS_TTY_CONFIG
+NoNewPrivileges=yes
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
