@@ -51,16 +51,16 @@ DEFAULT_CONFIG = {
 # How often each data source is refreshed (seconds). Things that change by the
 # second get a fast cadence; things that rarely change are polled lazily.
 CADENCE = {
-    "cpu": 1, "memory": 1, "traffic": 1, "diskio": 1, "temps": 2, "power": 10,
+    "cpu": 1, "memory": 1, "traffic": 1, "temps": 2, "power": 10,
     "gpus": 3, "services": 10, "runners": 5, "lan": 10,
-    "internet": 30, "docker": 15, "disks": 60, "kernel": 60,
+    "internet": 30, "docker": 15, "disks": 15, "drives": 15, "kernel": 60,
 }
 
 VT_ACTIVATE = 0x5606
 VT_GETSTATE = 0x5603
 # While nobody can see the screen, non-history sources are polled this many times less often.
 HIDDEN_SLOWDOWN = 4
-HISTORY_SOURCES = {"cpu", "memory", "traffic", "diskio"}
+HISTORY_SOURCES = {"cpu", "memory", "traffic"}
 INTERNAL_PANELS = ("eDP", "LVDS", "DSI")
 
 # ---------------------------------------------------------------- theme
@@ -167,9 +167,9 @@ BIG_FONT = {
     "9": ".##./#..#/.###/...#/.##.", " ": "../../../../..", "!": "#/#/#/./#", "-": ".../.../###/.../...",
 }
 BIG_ICONS = {
-    "ok": ["......#", ".....##", "#...##.", "##.##..", ".###...", "..#...."],
-    "warn": ["...#...", "..#.#..", "..#.#..", ".#.#.#.", ".#...#.", "#######"],
-    "crit": ["##...##", ".##.##.", "..###..", "..###..", ".##.##.", "##...##"],
+    "ok": ["......#", "#....##", "##..##.", ".####..", "..##..."],
+    "warn": ["...#...", "..#.#..", ".#.#.#.", ".#...#.", "#######"],
+    "crit": ["##...##", ".##.##.", "..###..", ".##.##.", "##...##"],
 }
 
 
@@ -224,7 +224,8 @@ def big_text(text: str) -> list[str]:
         glyph = BIG_FONT.get(ch, BIG_FONT[" "]).split("/")
         for i in range(5):
             rows[i] += glyph[i] + "."
-    return halfblock([r[:-1] for r in rows])
+    rows = [r[:-1] for r in rows]
+    return halfblock(["." * len(rows[0])] + rows)
 
 
 # ---------------------------------------------------------------- terminal styling
@@ -342,6 +343,8 @@ def read_int(path: str) -> int | None:
 
 def human_duration(seconds: float) -> str:
     seconds = int(seconds)
+    if seconds < 60:
+        return f"{max(0, seconds)}s"
     d, rem = divmod(seconds, 86400)
     h, rem = divmod(rem, 3600)
     m = rem // 60
@@ -455,6 +458,43 @@ def collect_disks() -> list[dict]:
             disks.append({"mount": parts[5], "pct": int(parts[4].rstrip("%")),
                           "avail_gb": round(int(parts[3]) / 1024 / 1024, 1)})
     return disks
+
+
+def collect_drives() -> list[dict]:
+    """Physical disks attached to the machine, with where (and whether) they are mounted."""
+    mounts: dict[str, list[str]] = {}
+    for line in (read("/proc/mounts") or "").splitlines():
+        p = line.split()
+        if len(p) >= 2 and p[0].startswith("/dev/"):
+            mounts.setdefault(os.path.basename(os.path.realpath(p[0])), []).append(p[1].replace("\\040", " "))
+    for line in (read("/proc/swaps") or "").splitlines()[1:]:
+        dev = line.split()[0]
+        if dev.startswith("/dev/"):
+            mounts.setdefault(os.path.basename(os.path.realpath(dev)), []).append("[swap]")
+    drives = []
+    for block in sorted(glob.glob("/sys/block/*")):
+        name = os.path.basename(block)
+        if re.match(r"(loop|ram|zram|dm-|sr|fd|md|nbd)", name):
+            continue
+        size = (read_int(f"{block}/size") or 0) * 512
+        if not size:
+            continue  # e.g. an empty card reader
+        real = os.path.realpath(block)
+        kind = ("NVMe" if name.startswith("nvme") else "USB" if "/usb" in real else "SD" if name.startswith("mmcblk")
+                else "HDD" if read(f"{block}/queue/rotational") == "1" else "SSD")
+        model = " ".join(filter(None, [read(f"{block}/device/vendor") if kind == "USB" else None,
+                                       read(f"{block}/device/model") or read(f"{block}/device/name")]))
+        # Mount points of the disk, its partitions, and anything stacked on them (LVM, LUKS).
+        nodes = [name] + [os.path.basename(p) for p in glob.glob(f"{block}/{name}*")]
+        nodes += [os.path.basename(h) for n in nodes for h in glob.glob(f"/sys/class/block/{n}/holders/*")]
+        mnt = sorted({m for n in nodes for m in mounts.get(n, [])}, key=lambda m: (len(m), m))
+        temp = None
+        for path in glob.glob(f"{block}/device/hwmon*/temp1_input") + glob.glob(f"{block}/device/hwmon/hwmon*/temp1_input"):
+            value = read_int(path)
+            temp = value / 1000 if value else temp
+        drives.append({"name": name, "kind": kind, "size_gb": size / 1e9, "model": " ".join(model.split()),
+                       "mounts": mnt, "temp": temp})
+    return drives
 
 
 def collect_temps() -> list[tuple[str, float]]:
@@ -667,9 +707,21 @@ def collect_docker() -> dict | None:
     if not out and run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=5) == "":
         return {"available": False}
     rows = [line.split("|", 2) for line in out.splitlines() if line.count("|") == 2]
+
+    def short(status: str) -> str:
+        status = re.sub(r"About an? ", "1 ", status)
+        status = re.sub(r"Less than a second", "<1 second", status)
+        status = re.sub(r" (second|minute|hour|day|week|month|year)s?", lambda m: m.group(1)[0] if m.group(1) != "month" else "mo", status)
+        status = re.sub(r"\s*\((healthy|health: starting)\)", "", status)
+        status = re.sub(r"\s*\(([^)]*)\)", r" · \1", status)
+        return status.replace(" ago", "").lower()
+
+    order = {"restarting": 0, "running": 2, "paused": 3, "created": 4, "exited": 5, "dead": 1}
+    containers = sorted(({"name": r[0], "state": r[1], "status": short(r[2]), "unhealthy": "unhealthy" in r[2]}
+                         for r in rows), key=lambda c: (0 if c["unhealthy"] else order.get(c["state"], 6), c["name"]))
     return {"available": True, "running": sum(1 for r in rows if r[1] == "running"), "total": len(rows),
             "unhealthy": [r[0] for r in rows if "unhealthy" in r[2]],
-            "restarting": [r[0] for r in rows if r[1] == "restarting"]}
+            "restarting": [r[0] for r in rows if r[1] == "restarting"], "containers": containers}
 
 
 def collect_kernel_warnings() -> list[str]:
@@ -715,16 +767,16 @@ class Collector:
         self.generation = 0  # bumped when the screen becomes visible, to refresh everything at once
         # One thread per group, so a slow source (docker, internet probes) never stalls the 1s ones.
         self.groups = [
-            ["cpu", "memory", "traffic", "diskio", "temps", "power"],
+            ["cpu", "memory", "traffic", "temps", "power"],
             ["gpus", "services", "runners", "lan"],
-            ["internet", "docker", "disks", "kernel"],
+            ["internet", "docker", "disks", "drives", "kernel"],
         ]
         self.funcs = {
-            "cpu": self.c_cpu, "memory": collect_memory, "traffic": self.c_traffic, "diskio": self.c_diskio,
-            "temps": collect_temps,
+            "cpu": self.c_cpu, "memory": collect_memory, "traffic": self.c_traffic, "temps": collect_temps,
             "power": collect_power, "gpus": self.c_gpus, "services": lambda: collect_services(self.cfg),
             "runners": self.c_runners, "lan": collect_lan, "internet": lambda: collect_internet(self.cfg),
-            "docker": collect_docker, "disks": collect_disks, "kernel": collect_kernel_warnings,
+            "docker": collect_docker, "disks": collect_disks, "drives": collect_drives,
+            "kernel": collect_kernel_warnings,
         }
 
     def run_task(self, name: str) -> None:
@@ -811,23 +863,6 @@ class Collector:
         self.hist["rx"].append(rx_rate)
         self.hist["tx"].append(tx_rate)
         return {"iface": iface, "rx": rx_rate, "tx": tx_rate}
-
-    def c_diskio(self) -> dict:
-        """Read/write throughput summed over whole physical disks (not partitions)."""
-        rd = wr = 0
-        for line in (read("/proc/diskstats") or "").splitlines():
-            p = line.split()
-            if len(p) >= 10 and re.fullmatch(r"nvme\d+n\d+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|mmcblk\d+", p[2]):
-                rd += int(p[5]) * 512
-                wr += int(p[9]) * 512
-        now = time.monotonic()
-        prev, self.prev["diskio"] = self.prev.get("diskio"), (rd, wr, now)
-        if not prev or now <= prev[2]:
-            return {"read": 0.0, "write": 0.0}
-        r, w = (rd - prev[0]) / (now - prev[2]), (wr - prev[1]) / (now - prev[2])
-        self.hist["dr"].append(r)
-        self.hist["dw"].append(w)
-        return {"read": r, "write": w}
 
     def gpu_name(self, slot: str, vendor: str) -> str:
         if slot not in self.gpu_names:
@@ -1174,10 +1209,12 @@ def stack(panels: list[Panel], width: int, avail: int | None, fill_to: int | Non
                 panels, sizes = panels[:-1], sizes[:-1]
     if fill_to is not None and panels:
         extra = max(0, fill_to - (sum(sizes) + 2 * len(panels)))
-        last = panels[-1]
-        if extra and last.grow and sizes[-1] == len(last.lines):
-            panels[-1] = Panel(**{**last.__dict__, "lines": last.lines + last.grow(extra), "grow": None})
-        sizes[-1] += extra
+        growable = [i for i, p in enumerate(panels) if p.grow and sizes[i] == len(p.lines)]
+        i = growable[-1] if growable else len(panels) - 1
+        if extra and growable:
+            grown = panels[i].lines + panels[i].grow(extra)
+            panels[i] = Panel(**{**panels[i].__dict__, "lines": grown, "grow": None})
+        sizes[i] += extra
     out = []
     for p, n in zip(panels, sizes):
         out += draw_panel(p, width, n)
@@ -1286,63 +1323,78 @@ def gpu_panel(d: dict, iw: int) -> Panel | None:
 
 
 def storage_panel(d: dict, iw: int) -> Panel | None:
-    disks = d.get("disks")
-    if not disks:
+    disks, drives = d.get("disks") or [], d.get("drives") or []
+    if not disks and not drives:
         return None
-    temps = dict(d.get("temps") or [])
     lines = []
-    bw = max(10, iw - 30)
+    bw = max(8, iw - 34)
     for disk in disks:
         label = disk["mount"] if len(disk["mount"]) <= 10 else "…" + disk["mount"][-9:]
         lines.append(S("text") + f"{label:<10}" + RESET + hbar(disk["pct"], bw, level_role(disk["pct"], 80, 90))
                      + S("text", bold=True) + f" {disk['pct']:>3}%" + RESET
                      + S("dim") + f" {size_label(disk['avail_gb'])} free" + RESET)
-    io, hist = d.get("diskio"), d.get("history") or {}
-    if io:
-        lines.append(S("dim") + "I/O       " + RESET + S("peach") + "read " + S("text", bold=True) + human_rate(io["read"]) + RESET
-                     + S("dim") + "  ·  " + RESET + S("pink") + "write " + S("text", bold=True) + human_rate(io["write"]) + RESET)
-    note = f"NVMe {temps['NVMe']:.0f}°C · 1s/60s" if "NVMe" in temps else "1s/60s"
-
-    def grow(extra: int) -> list[str]:
-        if not io:
-            return []
-        return dual_chart(hist.get("dr", []), hist.get("dw", []), ("read", "peach"), ("write", "pink"), iw, extra)
-
-    return Panel("disk", "Storage", lines, note=note, role="peach", grow=grow, min_lines=len(lines))
+    for dr in drives:
+        size = f"{dr['size_gb'] / 1000:.1f}T" if dr["size_gb"] >= 1000 else f"{dr['size_gb']:.0f}G"
+        temp = ""
+        if dr["temp"] is not None:
+            temp = S(level_role(dr["temp"], 60, 70)) + f"{dr['temp']:.0f}°C " + RESET
+        where = (S("ok") + " ".join(dr["mounts"]) if dr["mounts"] else S("warn") + "not mounted") + RESET
+        lines.append(T.icon("disk") + " " + S("text", bold=True) + f"{dr['name']:<8}" + RESET + S("peach") + f"{dr['kind']:<5}" + RESET
+                     + S("text") + f"{size:>6}  " + RESET + temp + where + S("dim") + "  " + dr["model"] + RESET)
+    return Panel("disk", "Storage", lines, note=f"{len(drives)} disk{'s' if len(drives) != 1 else ''} · 15s",
+                 role="peach", min_lines=len(lines))
 
 
-def services_panel(d: dict, iw: int) -> Panel:
-    svc = d.get("services")
-    if not svc:
-        return Panel("gear", "Services", [S("dim") + "checking…" + RESET], note="10s", role="blue")
-    entries = [("ssh", "active" if svc["ssh"] else "failed", "listening :22" if svc["ssh"] else "NOT listening")]
-    entries += [(name, state, "" if state == "active" else state) for name, _, state in svc["watched"] if state != "disabled"]
-    disabled = [name for name, _, state in svc["watched"] if state == "disabled"]
-    cols = 2 if len(entries) > 4 and iw >= 44 else 1
-    colw = iw // cols
-    cells = []
-    for name, state, note in entries:
-        note_role = "dim" if state in ("active", "disabled") else state_role(state)
-        cells.append(dot(state_role(state)) + " " + S("dim" if state == "disabled" else "text") + name + RESET
-                     + (" " + S(note_role) + note + RESET if note else ""))
-    per_col = math.ceil(len(cells) / cols)
-    lines = ["".join(fit(cells[c * per_col + r], colw - 1) + " " for c in range(cols) if c * per_col + r < len(cells))
-             for r in range(per_col)]
-    dk = d.get("docker")
+PAGE_SIZE, PAGE_SECONDS = 5, 4
+
+
+def carousel(items: list[str], title: str, icon: str, width: int) -> list[str]:
+    """Header plus PAGE_SIZE rows; flips to the next page every PAGE_SECONDS."""
+    pages = max(1, math.ceil(len(items) / PAGE_SIZE))
+    page = int(time.time() // PAGE_SECONDS) % pages
+    shown = items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    first, last = page * PAGE_SIZE + 1, page * PAGE_SIZE + len(shown)
+    dots = " ".join("●" if i == page else "·" for i in range(pages)) if pages <= 8 else f"{page + 1}/{pages}"
+    head = T.icon(icon) + " " + S("text", bold=True) + title + RESET + S("dim") \
+        + (f" {first}–{last} of {len(items)}  " if items else "  ") + RESET + S("accent") + (dots if pages > 1 else "") + RESET
+    rows = [head] + shown + [""] * (PAGE_SIZE - len(shown))
+    return [fit(r, width) for r in rows]
+
+
+def containers_panel(d: dict, iw: int) -> Panel:
+    """Docker containers and services side by side, 5 at a time, flipping every 4 seconds."""
+    colw = (iw - 2) // 2
+    dk, svc = d.get("docker"), d.get("services")
+    citems = []
+    if dk and dk.get("available"):
+        for c in dk.get("containers", []):
+            role = "warn" if c["unhealthy"] or c["state"] == "restarting" else "ok" if c["state"] == "running" else "dim"
+            citems.append(dot(role) + " " + S("text" if c["state"] == "running" else "dim") + c["name"] + RESET
+                          + S("dim") + "  " + c["status"] + RESET)
+    left = carousel(citems, "Containers", "docker", colw) if dk and dk.get("available") else \
+        [fit(T.icon("docker") + S("dim") + " Docker not available" + RESET, colw)] + [" " * colw] * PAGE_SIZE
+    sitems = []
+    if svc:
+        entries = [("ssh", "active" if svc["ssh"] else "failed", "listening :22" if svc["ssh"] else "NOT listening")]
+        entries += [(name, state, "" if state == "active" else state) for name, _, state in svc["watched"]]
+        watched_units = {f"{n}.service" for n, _, _ in svc["watched"]}
+        entries += [(u.removesuffix(".service"), "failed", sub) for _, u, sub in svc["failed"] if u not in watched_units]
+        entries.sort(key=lambda e: {"failed": 0, "restarting": 0, "activating": 1, "active": 2, "disabled": 3}.get(e[1], 0))
+        for name, state, note in entries:
+            note_role = "dim" if state in ("active", "disabled") else state_role(state)
+            sitems.append(dot(state_role(state)) + " " + S("dim" if state == "disabled" else "text") + name + RESET
+                          + (" " + S(note_role) + note + RESET if note else ""))
+    right = carousel(sitems, "Services", "gear", colw)
+    lines = [a + "  " + b for a, b in zip(left, right)]
+    notes = []
     if dk and dk.get("available"):
         bad = len(dk["unhealthy"]) + len(dk["restarting"])
-        lines.append(T.icon("docker") + " " + S("text") + "Docker " + S("ok" if not bad else "warn", bold=True)
-                     + f"{dk['running']}/{dk['total']}" + RESET + S("dim") + " containers running" + RESET
-                     + (S("warn") + f" · {bad} unhealthy" + RESET if bad else ""))
-    if disabled:
-        lines.append(S("dim") + f"• {len(disabled)} disabled: " + ", ".join(disabled) + RESET)
-    watched_units = {f"{n}.service" for n, _, _ in svc["watched"]}
-    others = [u for _, u, _ in svc["failed"] if u not in watched_units]
-    if others:
-        lines.append(S("crit") + f"● {len(others)} other failed unit(s): " + S("dim")
-                     + ", ".join(u.removesuffix(".service") for u in others) + RESET)
-    up = sum(1 for _, s, _ in entries if s == "active")
-    return Panel("gear", "Services", lines, note=f"{up}/{len(entries)} up · 10s", role="blue", min_lines=min(len(lines), 3))
+        notes.append(f"{dk['running']}/{dk['total']} up" + (f" · {bad} unhealthy" if bad else ""))
+    if svc:
+        up = sum(1 for _, _, st in svc["watched"] if st == "active") + (1 if svc["ssh"] else 0)
+        notes.append(f"{up} svc")
+    return Panel("docker", "Docker & Services", lines, note=" · ".join(notes + [f"{PAGE_SECONDS}s"]),
+                 role="blue", min_lines=len(lines))
 
 
 def runners_panel(d: dict, iw: int) -> Panel | None:
@@ -1353,26 +1405,25 @@ def runners_panel(d: dict, iw: int) -> Panel | None:
     frames = "▁▃▅▇▅▃"
     tick = int(time.time())
     lines = []
+    reasons = {"oom-kill": "OOM", "exit-code": "exit", "signal": "killed", "core-dump": "crash", "timeout": "timeout",
+               "start-limit-hit": "restarts"}
     for r in runners:
         who = S("text", bold=True) + r["name"] + RESET + S("dim") + "  " + r["repo"] + RESET
         if r["state"] == "busy":
             elapsed = human_duration(time.time() - r["since"]) if r["since"] else ""
-            state = S("ok") + frames[tick % len(frames)] + " " + S("ok", bold=True) + f"{'JOB ' + elapsed:<10}"
+            state = S("ok") + frames[tick % len(frames)] + " " + S("ok", bold=True) + f"{'JOB ' + elapsed:<11}"
         elif r["state"] == "idle":
-            state = dot("teal") + " " + S("teal") + f"{'idle':<10}"
+            state = dot("teal") + " " + S("teal") + f"{'idle':<11}"
         elif r["state"] == "down":
-            state = dot("crit") + " " + S("crit", bold=True) + f"{'down':<10}"
-            if r["reason"] and r["reason"] != "exit-code":
-                who += S("crit") + f"  {r['reason']}" + RESET
+            why = reasons.get(r["reason"] or "", r["reason"] or "")
+            state = dot("crit") + " " + S("crit", bold=True) + f"{('down · ' + why) if why else 'down':<11}"
         else:
-            continue
+            state = S("dim") + "· " + f"{'stopped':<11}"
         lines.append(state + RESET + " " + who)
-    off = [r for r in runners if r["state"] == "off"]
-    if off:
-        lines.append(S("dim") + f"● {len(off)} stopped: " + ", ".join(r["name"] for r in off) + RESET)
     note = " · ".join(f"{count[k]} {k}" for k in ("busy", "idle", "down", "off") if count[k]) + " · 5s"
+    # Never shrunk: every runner always gets its own line.
     return Panel("github", "GitHub Runners", lines, note=note, role="ok" if count["busy"] else "accent",
-                 min_lines=min(len(lines), 2))
+                 min_lines=len(lines))
 
 
 def lan_panel(d: dict, iw: int) -> Panel:
@@ -1484,9 +1535,10 @@ def banner(issues: list[Issue], width: int, tall: bool) -> list[str]:
     bg = S("base", kind)
     blank = bg + " " * width + RESET
     if tall and T.glyphs != "basic":
-        rows = [a + "    " + b for a, b in zip(halfblock(BIG_ICONS[kind]), big_text(text))]
+        icon = BIG_ICONS[kind]
+        rows = [a + "    " + b for a, b in zip(halfblock(["." * len(icon[0])] + icon), big_text(text))]
         if vlen(rows[0]) <= width - 4:
-            return [blank] + [bg + r.center(width) + RESET for r in rows] + [bg + sub.center(width) + RESET]
+            return [bg + r.center(width) + RESET for r in rows] + [bg + sub.center(width) + RESET]
     line = bg + f"{text}  -  {sub}".center(width) + RESET
     return [blank, line, blank] if tall else [line]
 
@@ -1517,16 +1569,16 @@ def render_lines(snap: Snapshot, width: int, height: int | None = None, vt: int 
         lw = int(width * 0.54)
         rw = width - lw - 1
         # Left: fast-moving numbers you look at most. Right: state that changes occasionally.
-        left = [p for p in (cpu_panel(d, lw - 4), gpu_panel(d, lw - 4), internet_panel(d, lw - 4)) if p]
-        right = [p for p in (services_panel(d, rw - 4), runners_panel(d, rw - 4),
-                             lan_panel(d, rw - 4), storage_panel(d, rw - 4)) if p]
+        left = [p for p in (cpu_panel(d, lw - 4), gpu_panel(d, lw - 4), internet_panel(d, lw - 4),
+                            storage_panel(d, lw - 4)) if p]
+        right = [p for p in (runners_panel(d, rw - 4), containers_panel(d, rw - 4), lan_panel(d, rw - 4)) if p]
         tallest = avail if avail is not None else max(len(stack(left, lw, None)), len(stack(right, rw, None)))
         lcol, rcol = stack(left, lw, avail, tallest), stack(right, rw, avail, tallest)
         lcol += [" " * lw] * (len(rcol) - len(lcol))
         rcol += [" " * rw] * (len(lcol) - len(rcol))
         lines += [a + " " + b for a, b in zip(lcol, rcol)]
     else:
-        panels = [p for p in (cpu_panel(d, width - 4), services_panel(d, width - 4), runners_panel(d, width - 4),
+        panels = [p for p in (runners_panel(d, width - 4), cpu_panel(d, width - 4), containers_panel(d, width - 4),
                               gpu_panel(d, width - 4), lan_panel(d, width - 4), internet_panel(d, width - 4),
                               storage_panel(d, width - 4)) if p]
         lines += stack(panels, width, avail, avail)
@@ -1534,7 +1586,7 @@ def render_lines(snap: Snapshot, width: int, height: int | None = None, vt: int 
         lines = lines[:height - 1]
         lines += [""] * (height - 1 - len(lines))
     footer = S("dim") + f" Updated {datetime.now().strftime('%H:%M:%S')} · refresh tuned per section:" \
-        " cores 1s · GPU 3s · runners 5s · services 10s · LAN 10s · internet 30s · disks 60s"
+        " cores 1s · GPU 3s · runners 5s · services 10s · LAN 10s · disks 15s · internet 30s"
     if vt:
         footer += f"  ·  Ctrl+Alt+F1 shell · Alt+F{vt} back"
     lines.append(footer + RESET)
@@ -1574,8 +1626,10 @@ def demo_snapshot(t: float | None = None) -> Snapshot:
                                  ("pihole", "system", "active")],
                      "failed": [], "ssh": True},
         "runners": [{"unit": "a", "repo": "website", "name": "homelab-1", "state": "busy", "since": time.time() - 754, "reason": None},
-                    {"unit": "b", "repo": "api", "name": "homelab-2", "state": "idle", "since": None, "reason": None},
-                    {"unit": "c", "repo": "api", "name": "homelab-3", "state": "off", "since": None, "reason": None}],
+                    {"unit": "b", "repo": "api", "name": "homelab-2", "state": "busy", "since": time.time() - 95, "reason": None},
+                    {"unit": "c", "repo": "api", "name": "homelab-3", "state": "idle", "since": None, "reason": None},
+                    {"unit": "d", "repo": "mobile-app", "name": "homelab-4", "state": "idle", "since": None, "reason": None},
+                    {"unit": "e", "repo": "docs", "name": "homelab-5", "state": "off", "since": None, "reason": None}],
         "lan": {"nics": [{"name": "eth0", "kind": "ethernet", "up": True, "default": True, "ip": "192.168.0.42",
                           "prefix": 24, "speed": 1000, "ssid": None, "signal": None, "dbm": None},
                          {"name": "wlan0", "kind": "wifi", "up": False, "default": False, "ip": None, "prefix": None,
@@ -1583,11 +1637,20 @@ def demo_snapshot(t: float | None = None) -> Snapshot:
                 "iface": "eth0", "gateway": "192.168.0.1", "gw_ms": 0.6, "devices": 23, "active": 9},
         "internet": {"state": "online", "latency": 14, "probes_ok": 2, "probes": 2, "ts_state": "Running", "ts_ip": "100.64.0.7"},
         "traffic": {"iface": "eth0", "rx": 2_450_000 * (0.6 + wave(3)), "tx": 310_000 * (0.5 + wave(5))},
-        "docker": {"available": True, "running": 11, "total": 12, "unhealthy": [], "restarting": []},
+        "docker": {"available": True, "running": 11, "total": 12, "unhealthy": [], "restarting": [],
+                   "containers": [{"name": n, "state": st, "status": stat, "unhealthy": False} for n, st, stat in (
+                       ("caddy", "running", "up 6d"), ("home-assistant", "running", "up 6d"),
+                       ("immich-server", "running", "up 2d"), ("immich-ml", "running", "up 2d"),
+                       ("jellyfin", "running", "up 6d"), ("paperless", "running", "up 6d"),
+                       ("postgres", "running", "up 6d"), ("redis", "running", "up 6d"),
+                       ("uptime-kuma", "running", "up 6d"), ("vaultwarden", "running", "up 6d"),
+                       ("watchtower", "running", "up 19h"), ("old-nextcloud", "exited", "exited 3w"))]},
         "kernel": [],
-        "diskio": {"read": 12_400_000 * wave(7), "write": 3_100_000 * wave(8)},
-        "history": {"dr": [abs(9e6 * math.sin((t + i) / 7)) ** 1.0 * (1 if (i // 9) % 3 else 0.2) for i in range(120)],
-                    "dw": [abs(3e6 * math.cos((t + i) / 4)) * (0.3 if (i // 13) % 2 else 1) for i in range(120)],"cpu": [35 + 30 * math.sin((t + i) / 6) + 10 * math.sin((t + i) / 2.3) for i in range(120)],
+        "drives": [{"name": "nvme0n1", "kind": "NVMe", "size_gb": 1000.2, "model": "WD Black SN770 1TB",
+                    "mounts": ["/", "/boot/efi"], "temp": 41.0},
+                   {"name": "sda", "kind": "HDD", "size_gb": 4000.8, "model": "WDC WD40EFRX", "mounts": ["/srv"], "temp": 34.0},
+                   {"name": "sdb", "kind": "USB", "size_gb": 64.0, "model": "SanDisk Ultra", "mounts": [], "temp": None}],
+        "history": {"cpu": [35 + 30 * math.sin((t + i) / 6) + 10 * math.sin((t + i) / 2.3) for i in range(120)],
                     "rx": [abs(2e6 * math.sin((t + i) / 5)) + 2e5 for i in range(120)],
                     "tx": [abs(4e5 * math.sin((t + i) / 3.3)) + 5e4 for i in range(120)],
                     "gpu:0000:01:00.0": [40 + 35 * math.sin((t + i) / 4) for i in range(120)],

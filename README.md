@@ -41,14 +41,14 @@ feels off, you open the lid and get… a login prompt. Then you log in, run `hto
 | 🚦 **One-glance verdict** | A big pixel-font banner: green **ALL SYSTEMS OK**, yellow **WARNINGS**, or red **ISSUES**, with the issues listed under it, most serious first. |
 | 🧠 **Per-core CPU** | A vertical bar for every core, coloured like a graphic equaliser (green, then yellow, then red as it fills), with load, clock, memory, swap, temperature and a 60-second usage history. |
 | 🎮 **Every GPU** | NVIDIA (via `nvidia-smi`), Intel (busy %, worked out from RC6 power-saving residency, plus clocks) and AMD (busy %, VRAM, temp, power). Each gets a utilisation history. A power-managed laptop dGPU that's asleep is **left asleep**, not woken up to be polled. |
-| 🐙 **GitHub Actions runners** | Self-hosted runners found automatically: which ones are **running a job, and for how long**, which are idle, which are down (with the reason, e.g. `oom-kill`), and which are stopped. |
+| 🐙 **GitHub Actions runners** | Self-hosted runners found automatically, **every one on its own line, always**: which are running a job and for how long, which are idle, which are down (with the reason, e.g. `OOM`), and which are stopped. This panel is never shrunk to make room. |
 | 🔗 **LAN** | Every physical NIC: Ethernet link and speed (warns about 10 Mb/s links and links with no IP), Wi-Fi SSID with signal bars and dBm, gateway round-trip time, and how many devices are visible on the LAN. |
 | 🌐 **Internet** | Reachability and latency, live ↓/↑ throughput with charts, and Tailscale state. |
-| 💾 **Storage** | Every real disk with smooth usage bars, NVMe temperature and live read/write charts. |
-| ⚙️ **Services** | SSH, your own list of systemd units (user or system), anything **failed or restart-looping**, and Docker containers. |
+| 💾 **Storage** | Usage bars for each filesystem, plus **every physical disk attached**: NVMe/SSD/HDD/USB, size, temperature, model, and where it's mounted. An attached disk that isn't mounted is highlighted. |
+| 🐳 **Docker & Services** | Two side-by-side carousels: **every Docker container** and **every service** (SSH, your watched units, anything failed), 5 at a time, flipping every 4 seconds. Problems sort to the front, so they show up on the first page. |
 | 🔋 **Battery, kept small** | One line in the header: charge, charging/discharging, time left and health. It turns red if the **charger is unplugged**. |
 | 🎨 **Real icons on a text console** | At install time it builds a copy of your console font with **pixel-art icons and 1/8-cell bar glyphs**, and loads a soft colour palette on its own terminal only. In a normal terminal it uses emoji and true colour instead. |
-| ⏱️ **Refresh tuned per section** | Each section updates as often as its data actually changes: cores every 1s, GPU 3s, runners 5s, services 10s, LAN 10s, internet 30s, disks 60s. Spare screen rows become charts. |
+| ⏱️ **Refresh tuned per section** | Each section updates as often as its data actually changes: cores every 1s, GPU 3s, runners 5s, services 10s, LAN 10s, disks 15s, internet 30s. Spare screen rows become charts. |
 | 💤 **Polite when nobody's looking** | With the lid closed and no monitor attached, it stops drawing and polls less often, but keeps the history so the charts are full when you open the lid. |
 | 👀 **Shows itself** | Opening the **lid** or plugging in an **HDMI/DP monitor** switches the console to the dashboard. |
 | 🪶 **Tiny & safe** | One Python file, standard library only, about 15 MB of RAM. No browser, no X/Wayland, no web server, no open ports. Runs as your user, reads only, and never runs anything based on input. |

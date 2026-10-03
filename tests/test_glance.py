@@ -63,6 +63,41 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual([i.level for i in glance.evaluate(data)], ["crit", "warn"])
 
 
+class PanelTests(unittest.TestCase):
+    def setUp(self):
+        glance.T = glance.Term("unicode", "ansi")
+
+    def text(self, panel):
+        return "\n".join(glance.ANSI_RE.sub("", line) for line in panel.lines)
+
+    def test_every_runner_is_listed_and_never_shrunk(self):
+        data = glance.demo_snapshot(t=0).data
+        data["runners"] = [{"unit": f"u{i}", "repo": "repo", "name": f"runner-{i}", "state": "off", "since": None,
+                            "reason": None} for i in range(15)]
+        panel = glance.runners_panel(data, 60)
+        self.assertEqual(len(panel.lines), 15)
+        self.assertEqual(panel.min_lines, 15)
+
+    def test_carousel_pages_through_everything(self):
+        items = [f"item-{i}" for i in range(12)]
+        seen = set()
+        original = glance.time.time
+        try:
+            for page in range(3):
+                glance.time.time = lambda page=page: page * glance.PAGE_SECONDS + 0.5
+                rows = glance.carousel(items, "Things", "gear", 40)
+                self.assertEqual(len(rows), glance.PAGE_SIZE + 1)
+                seen |= {r.strip() for r in (glance.ANSI_RE.sub("", x) for x in rows[1:]) if r.strip()}
+        finally:
+            glance.time.time = original
+        self.assertEqual(seen, set(items))
+
+    def test_unmounted_disk_is_called_out(self):
+        text = self.text(glance.storage_panel(glance.demo_snapshot(t=0).data, 80))
+        self.assertIn("sdb", text)
+        self.assertIn("not mounted", text)
+
+
 class DisplayWatcherTests(unittest.TestCase):
     def test_lid_open_and_new_monitor_trigger(self):
         states = iter([
